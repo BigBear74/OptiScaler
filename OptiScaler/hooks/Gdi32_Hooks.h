@@ -66,7 +66,7 @@ static NTSTATUS hkD3DKMTQueryAdapterInfo(const D3DKMT_QUERYADAPTERINFO* data)
             // Seem to be asic family and asic revision
             if (primaryGpu.fsr4Support == FSR4Support::INT8)
             {
-                amd_gpu_info[12] = 146; // gfx11
+                amd_gpu_info[12] = 145; // gfx11
                 amd_gpu_info[13] = 1;
 
                 return 1;
