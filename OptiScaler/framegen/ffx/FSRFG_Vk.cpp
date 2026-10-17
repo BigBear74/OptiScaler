@@ -92,6 +92,46 @@ static VkImageInfo GetImageInfo(VkImage image, VkImageView view, VkFormat format
     return { view, image, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 }, format, width, height };
 }
 
+// FFX imports its swapchain functions from vulkan-1.dll. Overlays like RTSS hook those and the driver's functions
+// behind them, and don't expect the real swapchain created inside the game's swapchain call, or presents from FFX's
+// threads on queues they never saw. FFX calls the driver directly, the game's swapchain still goes through them.
+static void BypassOverlayHooks(HMODULE ffxModule)
+{
+    static bool vulkanImports = false;
+
+    auto file = [](PVOID, HMODULE, LPCSTR pszFile) -> BOOL
+    {
+        vulkanImports = pszFile != nullptr && _stricmp(pszFile, "vulkan-1.dll") == 0;
+        return TRUE;
+    };
+
+    auto func = [](PVOID, DWORD, LPCSTR pszFunc, PVOID* ppvFunc) -> BOOL
+    {
+        if (!vulkanImports || pszFunc == nullptr || ppvFunc == nullptr)
+            return TRUE;
+
+        auto deviceFunc = (PVOID) VulkanHooks::OriginalSwapchainFunction(pszFunc);
+
+        if (deviceFunc == nullptr || *ppvFunc == deviceFunc)
+            return TRUE;
+
+        DWORD oldProtect = 0;
+        if (!VirtualProtect(ppvFunc, sizeof(PVOID), PAGE_READWRITE, &oldProtect))
+        {
+            LOG_WARN("Can't redirect FFX's {}", pszFunc);
+            return TRUE;
+        }
+
+        *ppvFunc = deviceFunc;
+        VirtualProtect(ppvFunc, sizeof(PVOID), oldProtect, &oldProtect);
+        LOG_DEBUG("FFX's {} goes to the driver", pszFunc);
+
+        return TRUE;
+    };
+
+    DetourEnumerateImportsEx(ffxModule, nullptr, file, func);
+}
+
 // The ones FFX's getRealSwapchainCreateInfo accepts
 static size_t SwapchainExtensionSize(VkStructureType type)
 {
@@ -200,6 +240,8 @@ bool FSRFG_Vk::CreateSwapchain(VkDevice device, const VkSwapchainCreateInfoKHR* 
     desc.asyncComputeQueue = queueInfo(asyncQueue);
     desc.presentQueue = queueInfo(presentQueue);
     desc.imageAcquireQueue = queueInfo(acquireQueue);
+
+    BypassOverlayHooks(FfxApiProxy::VkModule());
 
     auto result = FfxApiProxy::VULKAN_CreateContext()(&_swapChainContext, &desc.header, nullptr);
     LOG_INFO("Swapchain context creation result: {}", FfxApiProxy::ReturnCodeToString(result));
@@ -804,85 +846,4 @@ VkImageView FSRFG_Vk::PresentView(VkImage image)
 
     _presentViews[image] = view;
     return view;
-}
-
-VkCommandBuffer FSRFG_Vk::BeginCommandBuffer(int index)
-{
-    // Fence is created last, without it the rest might be missing too
-    if (_fence[index] == VK_NULL_HANDLE)
-    {
-        VkCommandPoolCreateInfo poolInfo { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
-        poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
-        poolInfo.queueFamilyIndex = _gameQueueFamily;
-
-        if (_commandPool[index] == VK_NULL_HANDLE &&
-            vkCreateCommandPool(_device, &poolInfo, nullptr, &_commandPool[index]) != VK_SUCCESS)
-        {
-            LOG_ERROR("vkCreateCommandPool failed for {}", index);
-            return VK_NULL_HANDLE;
-        }
-
-        VkCommandBufferAllocateInfo allocInfo { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
-        allocInfo.commandPool = _commandPool[index];
-        allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        allocInfo.commandBufferCount = 1;
-
-        if (_commandBuffer[index] == VK_NULL_HANDLE &&
-            vkAllocateCommandBuffers(_device, &allocInfo, &_commandBuffer[index]) != VK_SUCCESS)
-        {
-            LOG_ERROR("vkAllocateCommandBuffers failed for {}", index);
-            return VK_NULL_HANDLE;
-        }
-
-        VkFenceCreateInfo fenceInfo { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-        fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-
-        if (vkCreateFence(_device, &fenceInfo, nullptr, &_fence[index]) != VK_SUCCESS)
-        {
-            LOG_ERROR("vkCreateFence failed for {}", index);
-            return VK_NULL_HANDLE;
-        }
-    }
-
-    if (vkWaitForFences(_device, 1, &_fence[index], VK_TRUE, 1'000'000'000) != VK_SUCCESS)
-    {
-        LOG_ERROR("Waiting for the FG command buffer {} timed out", index);
-        return VK_NULL_HANDLE;
-    }
-
-    vkResetCommandPool(_device, _commandPool[index], 0);
-
-    VkCommandBufferBeginInfo beginInfo { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(_commandBuffer[index], &beginInfo);
-
-    return _commandBuffer[index];
-}
-
-void FSRFG_Vk::WaitForCommandBuffers()
-{
-    for (auto fence : _fence)
-    {
-        if (fence != VK_NULL_HANDLE)
-            vkWaitForFences(_device, 1, &fence, VK_TRUE, 1'000'000'000);
-    }
-}
-
-void FSRFG_Vk::DestroyCommandBuffers()
-{
-    WaitForCommandBuffers();
-
-    for (size_t i = 0; i < BUFFER_COUNT; i++)
-    {
-        if (_fence[i] != VK_NULL_HANDLE)
-            vkDestroyFence(_device, _fence[i], nullptr);
-
-        // Frees the command buffer too
-        if (_commandPool[i] != VK_NULL_HANDLE)
-            vkDestroyCommandPool(_device, _commandPool[i], nullptr);
-
-        _fence[i] = VK_NULL_HANDLE;
-        _commandPool[i] = VK_NULL_HANDLE;
-        _commandBuffer[i] = VK_NULL_HANDLE;
-    }
 }
