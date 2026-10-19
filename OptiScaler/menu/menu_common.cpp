@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "menu_common.h"
+#include "PresentRateMeter.h"
 #include <inputs/FG/XeFG_Inputs_Dx12.h>
 
 #include "input/input_system.h"
@@ -10,6 +11,8 @@
 #include <proxies/XeFG_Proxy.h>
 #include <proxies/FfxApi_Proxy.h>
 #include <upscalers/ffx/FFXFeature.h>
+#include <fsr4/FSR4Models.h>
+#include <fsr4/FSR4Presets.h>
 #include <proxies/Streamline_Proxy.h>
 
 #include <framegen/nvngx/Nvngx_FG.h>
@@ -1706,43 +1709,16 @@ void MenuCommon::Present()
         UpdateManualInput(_handle);
 }
 
-static std::atomic<bool> fgOutputPresents = false;
-static std::atomic<uint32_t> fgOutputPresentCount = 0;
-static double fgOutputLastSample = 0.0;
-static double fgOutputFrameTime = 0.0;
+static PresentRateMeter fgOutputPresentRate;
 
-// Streamline presents the real and the generated frames from different threads.
-// With flip metering they are submitted back to back and paced by the display, so the
-// frame time is averaged over all presents between menu frames instead of the last interval.
-void MenuCommon::FGOutputPresent() { fgOutputPresentCount++; }
+// Streamline can present real and generated frames from different threads.
+// Measure the actual output-present cadence, not the number of presents
+// observed between two (independently paced) menu frames.
+void MenuCommon::FGOutputPresent() { fgOutputPresentRate.Present(Util::MillisecondsNow()); }
 
-void MenuCommon::FGOutputPresents(bool presents) { fgOutputPresents = presents; }
+void MenuCommon::FGOutputPresents(bool presents) { fgOutputPresentRate.SetEnabled(presents); }
 
-static double FGOutputFrameTime(double now)
-{
-    if (!fgOutputPresents)
-    {
-        fgOutputPresentCount = 0;
-        fgOutputLastSample = 0.0;
-        fgOutputFrameTime = 0.0;
-        return 0.0;
-    }
-
-    if (fgOutputLastSample <= 0.0)
-    {
-        fgOutputPresentCount = 0;
-        fgOutputLastSample = now;
-        return 0.0;
-    }
-
-    if (auto count = fgOutputPresentCount.exchange(0); count > 0)
-    {
-        fgOutputFrameTime = (now - fgOutputLastSample) / count;
-        fgOutputLastSample = now;
-    }
-
-    return fgOutputFrameTime;
-}
+static double FGOutputFrameTime(double now) { return fgOutputPresentRate.FrameTime(now); }
 
 struct VersionCheckStatus
 {
@@ -1763,6 +1739,8 @@ struct MenuCommon::RenderMenuContext
     double now = 0.0;
     double frameTime = 0.0;
     double frameRate = 0.0;
+    // Current Vulkan FG output rate, kept separate from the long-term history.
+    double fgOutputFrameTimeMs = 0.0;
     float menuResScale = 1.0f;
     float fpsScale = 1.0f;
     float averageFrameTime = 0.0f;
@@ -1813,9 +1791,10 @@ void MenuCommon::UpdateRenderTiming(RenderMenuContext& ctx)
         frameRate = 1000.0 / frameTime;
     }
 
-    if (auto fgFrameTime = FGOutputFrameTime(now); fgFrameTime > 0.0)
+    ctx.fgOutputFrameTimeMs = FGOutputFrameTime(now);
+    if (ctx.fgOutputFrameTimeMs > 0.0)
     {
-        frameTime = fgFrameTime;
+        frameTime = ctx.fgOutputFrameTimeMs;
         frameRate = 1000.0 / frameTime;
     }
 
@@ -2224,6 +2203,15 @@ void MenuCommon::UpdateFrameTimeAverages(RenderMenuContext& ctx)
         frameTime /= frameCnt;
         frameRate = 1000.0 / frameTime;
         frameTimesCalculated = true;
+
+        // Vulkan FG output timing is already averaged across the last 125 ms.
+        // Use it directly for the current FPS readout; preserve the shared
+        // history for the separately labelled average and frame-time graph.
+        if (ctx.fgOutputFrameTimeMs > 0.0)
+        {
+            frameTime = ctx.fgOutputFrameTimeMs;
+            frameRate = 1000.0 / frameTime;
+        }
 
         float lastFT = static_cast<float>(state.frameTimes.empty() ? 0.0f : state.frameTimes.back());
         float lastUT = static_cast<float>(state.upscaleTimes.empty() ? 0.0f : state.upscaleTimes.back());
@@ -3178,10 +3166,64 @@ void MenuCommon::RenderActiveUpscalerSettings(RenderMenuContext& ctx)
             ImGui::SameLine();
             if (state.currentFsr4Preset.has_value())
                 ImGui::TextDisabled("(Active: %d)", state.currentFsr4Preset.value());
-            else if (FSR4ModelSelection::IsInt8FsrHooked())
+            else if (FSR4Presets::IsAnyModuleHooked())
                 ImGui::TextColored(toneMapColor(ImVec4(1.f, 0.8f, 0.f, 1.f)), "(Potential FSR3 fallback)");
             else
                 ImGui::TextDisabled("(Failed to hook)");
+
+            // FSR 4 Models of the module running the selected upscaler, only listed when the GPU can run more than one
+            HMODULE upscalerModule = nullptr;
+            if (auto versions = GetFfxVersionList(currentBackend, state.api);
+                versions == &state.ffxUpscalerVersionsDx12 && config->FfxUpscalerIndex.value_or_default() >= 0 &&
+                config->FfxUpscalerIndex.value_or_default() < versions->ids.size())
+            {
+                upscalerModule =
+                    FfxApiProxy::UpscalerModule(versions->ids[config->FfxUpscalerIndex.value_or_default()]);
+            }
+
+            if (auto models = FSR4Models::SelectableModels(upscalerModule); !models.empty())
+            {
+                auto& selectedModel = config->Fsr4Model;
+                auto selectedName = selectedModel.has_value() ? FSR4Models::Name(selectedModel.value()) : "Auto";
+                bool modelChanged = false;
+
+                ImGui::SetNextItemWidth(150.0f * menuResScale);
+                if (ImGui::BeginCombo("FSR4 Model", selectedName))
+                {
+                    if (ImGui::Selectable("Auto", !selectedModel.has_value()) && selectedModel.has_value())
+                    {
+                        selectedModel.reset();
+                        modelChanged = true;
+                    }
+
+                    for (auto model : models)
+                    {
+                        if (ImGui::Selectable(FSR4Models::Name(model), selectedModel == model) &&
+                            selectedModel != model)
+                        {
+                            selectedModel = model;
+                            modelChanged = true;
+                        }
+                    }
+
+                    ImGui::EndCombo();
+                }
+
+                if (modelChanged)
+                {
+                    state.newBackend = currentBackend;
+                    MARK_ALL_BACKENDS_CHANGED();
+                }
+
+                ShowTooltip("FSR 4 network to run.\n"
+                            "Auto lets FFX pick the best one the GPU supports.");
+
+                ImGui::SameLine();
+                if (auto activeModel = FSR4Models::ActiveModel(upscalerModule))
+                    ImGui::TextDisabled("(Active: %s)", FSR4Models::Name(*activeModel));
+                else
+                    ImGui::TextColored(toneMapColor(ImVec4(1.f, 0.8f, 0.f, 1.f)), "(Potential FSR3 fallback)");
+            }
         }
 
         if (majorFsrVersion >= 3)
